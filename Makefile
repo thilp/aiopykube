@@ -32,6 +32,5 @@ coverage.html: test.unit
 .PHONY: clean
 clean:
 	find . \( -name __pycache__ -o -name .pytest_cache \) -exec rm -r '{}' +
-	rm -rf *.egg-info/
-	rm -f .coverage
-	rm -rf coverage.html/
+	rm -rf *.egg-info/ dist/
+	rm -rf .coverage coverage.html/
