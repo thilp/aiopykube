@@ -1,3 +1,5 @@
 .poetry.fresh
+*.egg-info/
+dist/
 coverage.html/
 .coverage
