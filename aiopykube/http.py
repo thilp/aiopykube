@@ -2,14 +2,16 @@ import asyncio
 import inspect
 import posixpath
 import ssl
+import sys
+import warnings
 from typing import Optional, Dict, Any, Tuple, Union
 from urllib.parse import urlparse
 
 import aiohttp
 
 from . import __version__
+from . import errors
 from .config import KubeConfig, BytesOrFile
-from .errors import HTTPError
 
 Response = aiohttp.ClientResponse
 
@@ -19,6 +21,11 @@ DEFAULT_HTTP_TIMEOUT = 10  # seconds
 class HTTPClient:
     """
     Client for interfacing with the Kubernetes API.
+
+    This object can be used either directly (as in synchronous pykube) or as
+    an asynchronous context manager (``async with``).
+    As a context manager, it will properly close the connection pool for you.
+    If you use it without a context manager, you should call :meth:`close` after use.
     """
 
     def __init__(
@@ -27,42 +34,67 @@ class HTTPClient:
         *,
         timeout: float = DEFAULT_HTTP_TIMEOUT,
         session: Optional[aiohttp.ClientSession] = None,
+        default_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         if inspect.iscoroutine(config):
             raise ValueError(f"should be awaited: {config.__qualname__}")
+        if default_headers is None:
+            default_headers = {}
         self.config = config
         self.timeout = timeout
-        self.default_headers = {"User-Agent": f"aiopykube/{__version__}"}
         self.session = session
         self.kwargs: Optional[Dict[str, Any]] = None
-
-    def __enter__(self) -> None:
-        raise TypeError(
-            f"use 'async with' instead of 'with' on {self.__class__.__qualname__}"
-        )
-
-    __exit__ = None
+        self.default_headers = {
+            "User-Agent": f"aiopykube/{__version__}",
+            **default_headers,
+        }
 
     async def __aenter__(self) -> "HTTPClient":
-        kwargs = await self._prepare_kwargs()
-        headers = {**self.default_headers, **kwargs.pop("headers", {})}
-        connector = aiohttp.TCPConnector(ssl=kwargs.pop("ssl", None))
-        self.session = aiohttp.ClientSession(
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=self.timeout),
-            connector=connector,
-            **kwargs,
-        )
+        if self.session is None:
+            self.session = await self._make_session()
         return self
 
     async def __aexit__(self, *_) -> None:
+        await self.close()
+
+    def __del__(self) -> None:
+        if self.session is None:
+            return
+
+        # We can't close the session from a non-async method, but we can warn.
+        context = {
+            "message": f"aiopykube: Unclosed {self.__class__.__name__} instance!",
+            "http_client": self,
+        }
+
+        kwargs = {}
+        if sys.version_info >= (3, 6):
+            kwargs = {"source": self}
+        warnings.warn(context["message"], ResourceWarning, **kwargs)
+
+        self.session.loop.call_exception_handler(context)
+
+    async def close(self) -> None:
+        if self.session is None:
+            return
         await self.session.close()
         self.session = None
         # See:
         # https://aiohttp.readthedocs.io/en/stable/client_advanced.html#graceful-shutdown
         await asyncio.sleep(0.250)
 
-    async def _prepare_kwargs(self) -> Dict[str, Any]:
+    async def _make_session(self) -> aiohttp.ClientSession:
+        kwargs = await self._prepare_session_kwargs()
+        headers = {**self.default_headers, **kwargs.pop("headers", {})}
+        connector = aiohttp.TCPConnector(ssl=kwargs.pop("ssl", None))
+        return aiohttp.ClientSession(
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            connector=connector,
+            **kwargs,
+        )
+
+    async def _prepare_session_kwargs(self) -> Dict[str, Any]:
         kwargs = {"headers": {}}
 
         # Setup certificate verification.
@@ -107,7 +139,7 @@ class HTTPClient:
         Get the Kubernetes API version.
         """
         resp = await self.get(version="", base="/version")
-        await self.raise_for_status(resp)
+        await raise_for_status(resp)
         data = await resp.json()
         return data["major"], data["minor"]
 
@@ -120,7 +152,7 @@ class HTTPClient:
         cached_attr = f"_cached_resource_list_{api_version}"
         if not hasattr(self, cached_attr):
             resp = await self.get(version=api_version)
-            await self.raise_for_status(resp)
+            await raise_for_status(resp)
             setattr(self, cached_attr, await resp.json())
         return getattr(self, cached_attr)
 
@@ -130,7 +162,7 @@ class HTTPClient:
         version: Optional[str] = "v1",
         base: str = "",
         namespace: Optional[str] = None,
-        endpoint: str = "",
+        url: str = "",
         timeout: Union[None, aiohttp.ClientTimeout, float] = None,
         **kwargs,
     ) -> Dict[str, Any]:
@@ -152,9 +184,9 @@ class HTTPClient:
             if namespace:
                 bits.extend(["namespaces", namespace])
 
-        if endpoint.startswith("/"):
-            endpoint = endpoint[1:]
-        bits.append(endpoint)
+        if url.startswith("/"):
+            url = url[1:]
+        bits.append(url)
 
         kwargs["url"] = self.url + posixpath.join(*bits)
 
@@ -167,42 +199,28 @@ class HTTPClient:
 
         return kwargs
 
-    async def raise_for_status(self, resp: Response) -> None:
-        """
-        Wraps :meth:`aiohttp.ClientResponse.raise_for_status` by raising a
-        :class:`aiopykube.errors.HTTPError` (with details from the response)
-        when possible.
-        Otherwise, the intercepted exception is raised again.
-        """
-        try:
-            resp.raise_for_status()
-        except aiohttp.ClientResponseError as err:
-            if resp.headers["content-type"] == "application/json" and not resp.closed:
-                payload = await resp.json()
-                if payload.get("kind") == "Status":
-                    raise HTTPError(
-                        code=resp.status, message=payload.get("message", "")
-                    ) from err
-            raise
-
     async def get(
         self,
         *,
         version: Optional[str] = "v1",
         base: str = "",
         namespace: Optional[str] = None,
-        endpoint: str = "",
+        url: str = "",
         timeout: Union[None, aiohttp.ClientTimeout, float] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Response:
         """Executes an HTTP GET request against the API server."""
+        if self.session is None:
+            self.session = await self._make_session()
         return await self.session.get(
+            headers=headers,
             **self._convert_kwargs(
                 version=version,
                 base=base,
                 namespace=namespace,
-                endpoint=endpoint,
+                url=url,
                 timeout=timeout,
-            )
+            ),
         )
 
     async def options(
@@ -211,18 +229,22 @@ class HTTPClient:
         version: Optional[str] = "v1",
         base: str = "",
         namespace: Optional[str] = None,
-        endpoint: str = "",
+        url: str = "",
         timeout: Union[None, aiohttp.ClientTimeout, float] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Response:
         """Executes an HTTP OPTIONS request against the API server."""
+        if self.session is None:
+            self.session = await self._make_session()
         return await self.session.options(
+            headers=headers,
             **self._convert_kwargs(
                 version=version,
                 base=base,
                 namespace=namespace,
-                endpoint=endpoint,
+                url=url,
                 timeout=timeout,
-            )
+            ),
         )
 
     async def head(
@@ -231,18 +253,22 @@ class HTTPClient:
         version: Optional[str] = "v1",
         base: str = "",
         namespace: Optional[str] = None,
-        endpoint: str = "",
+        url: str = "",
         timeout: Union[None, aiohttp.ClientTimeout, float] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Response:
         """Executes an HTTP HEAD request against the API server."""
+        if self.session is None:
+            self.session = await self._make_session()
         return await self.session.head(
+            headers=headers,
             **self._convert_kwargs(
                 version=version,
                 base=base,
                 namespace=namespace,
-                endpoint=endpoint,
+                url=url,
                 timeout=timeout,
-            )
+            ),
         )
 
     async def post(
@@ -251,18 +277,24 @@ class HTTPClient:
         version: Optional[str] = "v1",
         base: str = "",
         namespace: Optional[str] = None,
-        endpoint: str = "",
+        url: str = "",
         timeout: Union[None, aiohttp.ClientTimeout, float] = None,
+        headers: Optional[Dict[str, str]] = None,
+        json: Optional[dict] = None,
     ) -> Response:
         """Executes an HTTP POST request against the API server."""
+        if self.session is None:
+            self.session = await self._make_session()
         return await self.session.post(
+            headers=headers,
+            json=json,
             **self._convert_kwargs(
                 version=version,
                 base=base,
                 namespace=namespace,
-                endpoint=endpoint,
+                url=url,
                 timeout=timeout,
-            )
+            ),
         )
 
     async def put(
@@ -271,18 +303,24 @@ class HTTPClient:
         version: Optional[str] = "v1",
         base: str = "",
         namespace: Optional[str] = None,
-        endpoint: str = "",
+        url: str = "",
         timeout: Union[None, aiohttp.ClientTimeout, float] = None,
+        headers: Optional[Dict[str, str]] = None,
+        json: Optional[dict] = None,
     ) -> Response:
         """Executes an HTTP PUT request against the API server."""
+        if self.session is None:
+            self.session = await self._make_session()
         return await self.session.put(
+            headers=headers,
+            json=json,
             **self._convert_kwargs(
                 version=version,
                 base=base,
                 namespace=namespace,
-                endpoint=endpoint,
+                url=url,
                 timeout=timeout,
-            )
+            ),
         )
 
     async def patch(
@@ -291,18 +329,24 @@ class HTTPClient:
         version: Optional[str] = "v1",
         base: str = "",
         namespace: Optional[str] = None,
-        endpoint: str = "",
+        url: str = "",
         timeout: Union[None, aiohttp.ClientTimeout, float] = None,
+        headers: Optional[Dict[str, str]] = None,
+        json: Optional[dict] = None,
     ) -> Response:
         """Executes an HTTP PATCH request against the API server."""
+        if self.session is None:
+            self.session = await self._make_session()
         return await self.session.patch(
+            headers=headers,
+            json=json,
             **self._convert_kwargs(
                 version=version,
                 base=base,
                 namespace=namespace,
-                endpoint=endpoint,
+                url=url,
                 timeout=timeout,
-            )
+            ),
         )
 
     async def delete(
@@ -311,16 +355,55 @@ class HTTPClient:
         version: Optional[str] = "v1",
         base: str = "",
         namespace: Optional[str] = None,
-        endpoint: str = "",
+        url: str = "",
         timeout: Union[None, aiohttp.ClientTimeout, float] = None,
+        headers: Optional[Dict[str, str]] = None,
+        json: Optional[dict] = None,
     ) -> Response:
         """Executes an HTTP DELETE request against the API server."""
+        if self.session is None:
+            self.session = await self._make_session()
         return await self.session.delete(
+            headers=headers,
+            json=json,
             **self._convert_kwargs(
                 version=version,
                 base=base,
                 namespace=namespace,
-                endpoint=endpoint,
+                url=url,
                 timeout=timeout,
-            )
+            ),
         )
+
+
+def ok(resp: Response) -> bool:
+    """
+    Returns True if (and only if) *resp.status* is not between 400 (included)
+    and 600 (excluded).
+    """
+    return not (400 <= resp.status < 600)
+
+
+async def raise_for_status(resp: Response) -> None:
+    """
+    If :meth:`ok` returns True, do nothing. Otherwise, raises an
+    :class:`errors.HTTPError` describing the error.
+    """
+    # We don't rely on aiohttp's raise_for_status because it calls
+    # resp.release before we're done with the body.
+    if ok(resp):
+        return
+
+    details: Optional[str] = None
+    try:
+        if resp.content_type == "application/json":
+            payload = await resp.json()
+            if payload.get("kind") == "Status":
+                details = payload.get("message")
+    except Exception:  # We're just trying to gather more information.
+        pass
+
+    resp.release()
+    raise errors.HTTPError(
+        code=resp.status, message=details or resp.reason, request=resp.request_info
+    )

@@ -11,6 +11,8 @@ asyncio = "^3.4"
 aiohttp = "^3.5"
 pyyaml = "^5.1"
 tenacity = "^5.0"
+jsonpatch = "^1.23"
+dataclasses = "^0.6.0"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.0"
