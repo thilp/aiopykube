@@ -37,7 +37,7 @@ format: .make/black.format
 
 .make/black.format: .make/poetry.install $(SOURCES)
 	poetry run black $(SRCDIR)
-	@touch $@
+	@touch $@ .make/black.check
 
 .make/flake8: .make/poetry.install $(SOURCES) .flake8
 	poetry run flake8
