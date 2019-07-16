@@ -50,7 +50,7 @@ test: test.unit
 test.unit: .coverage
 
 .coverage: .make/poetry.install $(SOURCES) $(UNITTESTS)
-	poetry run pytest --doctest-modules --cov=$(SRCDIR) $(TESTDIR)
+	poetry run pytest --doctest-modules --cov=$(SRCDIR) $(TESTDIR) $(SRCDIR)
 
 coverage.html: .coverage
 	poetry run coverage html -d $@
