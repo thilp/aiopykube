@@ -1,6 +1,7 @@
 import enum
 from dataclasses import dataclass
-from typing import Any, List, Union
+from typing import List, Union
+
 import jsonpatch
 
 
