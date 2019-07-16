@@ -32,13 +32,11 @@ class APIObject:
         version: str,
         kind: Optional[str] = None,
         plural: Optional[str] = None,
-        base: Optional[str] = None,
         **_,
     ) -> None:
         cls.kind = kind or cls.__name__
         cls.plural = plural or cls.kind.lower() + "s"
         cls.version = version
-        cls.base = base
 
     def __init__(self, api: HTTPClient, obj: dict) -> None:
         self.api = api
@@ -96,9 +94,6 @@ class APIObject:
             query_string = urlencode(params)
             if query_string:
                 kwargs["url"] += f"?{query_string}"
-
-        if self.base:
-            kwargs["base"] = self.base
 
         kwargs["version"] = self.version
 
@@ -208,12 +203,9 @@ class NamespacedAPIObject(APIObject, kind=None, plural=None, version=None):
         version: str,
         kind: Optional[str] = None,
         plural: Optional[str] = None,
-        base: Optional[str] = None,
         **kwargs,
     ) -> None:
-        super().__init_subclass__(
-            kind=kind, plural=plural, version=version, base=base, **kwargs
-        )
+        super().__init_subclass__(kind=kind, plural=plural, version=version, **kwargs)
 
     @property
     def namespace(self) -> str:
